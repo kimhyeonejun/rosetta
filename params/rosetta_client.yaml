@@ -18,7 +18,7 @@ rosetta_client:
 
     # Policy architecture type
     # Options: "act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05"
-    policy_type: "act"
+    policy_type: "pi05"
 
     # Device for policy inference: "cuda", "cpu", "mps", or specific like "cuda:0"
     policy_device: "cuda"
@@ -30,13 +30,12 @@ rosetta_client:
     # Server filters most non-must_go observations via similarity check (atol=1).
     # At 30Hz: actions_per_chunk=50 → ~1.67s between inferences
     #          actions_per_chunk=10 → ~0.33s between inferences
-    actions_per_chunk: 30
-
+    actions_per_chunk: 50
     # Threshold for when to request new action chunk (0.0 - 1.0)
     # Controls when client SENDS observations to server.
     # Server may still FILTER them via _obs_sanity_checks (similarity + timestep).
     # Only must_go=True observations bypass filtering entirely.
-    chunk_size_threshold: 0.95
+    chunk_size_threshold: 0.5
 
     # How to aggregate overlapping action chunks
     # Options: "weighted_average" (0.3*old + 0.7*new), "latest_only" (new only),
@@ -74,3 +73,23 @@ rosetta_client:
     #
     # To measure your sim speed: ros2 topic hz /clock (should be ~60Hz for real-time)
     sim_time_multiplier: 1.0
+
+    # Per-observation image codec applied before pickle/gRPC.
+    #
+    # Options:
+    #   "none"     – send raw uint8 numpy (default; ~450KB / obs for 3x224x224x3)
+    #   "identity" – plumbing test (still raw, but wrapped in CompressedImagePayload)
+    #   "msillm"   – MS-ILLM neural compression (~1–5KB / obs, GPU recommended)
+    #
+    # MS-ILLM additional setup:
+    #   * Both client and server need neuralcompression installed:
+    #       bash scripts/install_msillm.sh
+    #   * Server side (run_policy_server_pi05.py) auto-installs the decompress
+    #     hook on import, so any payload received goes through the right codec
+    #     based on its own header.
+    #   * Tune quality/device via env vars on each side:
+    #       LEROBOT_MSILLM_QUALITY   1..6 (default 4 ~ 0.3bpp)
+    #       LEROBOT_MSILLM_DEVICE    cuda | cpu | cuda:N (auto by default)
+    #       LEROBOT_MSILLM_HUB_DIR   override torch.hub cache (offline servers)
+    #   * Pretrained weights are CC-BY-NC 4.0 — research/demo use only.
+    image_codec: "none"

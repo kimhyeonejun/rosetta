@@ -130,6 +130,17 @@ class RosettaClientNode(LifecycleNode):
                 "Set to 1.0 for real-time or when not using sim time."
             )
         )
+        self.declare_parameter(
+            "image_codec", "none",
+            ParameterDescriptor(
+                description="Per-observation image codec applied before pickle/gRPC. "
+                "'none' sends raw uint8 (current behavior). 'identity' uses the no-op "
+                "codec for plumbing tests. 'msillm' uses MS-ILLM neural compression "
+                "(requires neuralcompression on both client and server; configure "
+                "quality/device via LEROBOT_MSILLM_QUALITY / LEROBOT_MSILLM_DEVICE).",
+                read_only=True,
+            )
+        )
 
         # Initialize state variables (resources created in lifecycle callbacks)
         self._contract_path: str | None = None
@@ -161,8 +172,11 @@ class RosettaClientNode(LifecycleNode):
             return TransitionCallbackReturn.FAILURE
         # Distinguish local paths from HF repo IDs (e.g. "user/model").
         # Local paths start with /, ./, or ../
+        # Skip the check when the policy server runs remotely — in that case
+        # the path is resolved on the server, not on this client machine.
         _looks_local = self._pretrained.startswith(('/', './', '../'))
-        if _looks_local and not os.path.isdir(self._pretrained):
+        _server_is_remote = not self.get_parameter("launch_local_server").value
+        if _looks_local and not _server_is_remote and not os.path.isdir(self._pretrained):
             self.get_logger().error(
                 f"Local model path does not exist: {self._pretrained}. "
                 "Use a HuggingFace repo ID (e.g. 'user/model') or a valid local directory."
@@ -369,7 +383,13 @@ class RosettaClientNode(LifecycleNode):
 
         try:
             config = self._build_config(task)
-            client = RobotClient(config)
+            codec_name = (self.get_parameter("image_codec").value or "none").lower()
+            if codec_name in ("", "none", "off", "raw"):
+                client = RobotClient(config)
+            else:
+                from rosetta.common.compression.integration import CompressedRobotClient
+                self.get_logger().info(f"Image codec enabled: {codec_name}")
+                client = CompressedRobotClient(config, codec_name=codec_name)
             self._client = client
 
             if not client.start():
