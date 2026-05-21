@@ -56,15 +56,46 @@ def decompress_inplace(obs_obj: Any) -> Any:
     """Apply decompress_observation to whichever dict carries the images.
 
     LeRobot wraps the dict inside a TimedObservation; older paths pass the
-    dict directly. Handle both.
+    dict directly. Handle both. Two side-effect hooks fire around decoding:
+
+      - BPP sink (before decode): measures compressed payload size against
+        the on-wire bytes — meaningful only at this point because the
+        payload object is destroyed by decompress_observation.
+      - PNG sink (after decode): saves what the policy sees.
+
+    Both are no-ops unless their respective env vars are set.
     """
+    # Local imports keep cv2/csv work out of the hot path when both hooks
+    # are inactive.
+    from .dumping import bpp_sink as _bpp_sink, sink as _png_sink, timestep_of
+    from .payload import CompressedImagePayload
+
     inner = getattr(obs_obj, "observation", None)
     if isinstance(inner, dict):
-        obs_obj.observation = decompress_observation(inner)
+        wrapper = obs_obj
+        bare = False
+    elif isinstance(obs_obj, dict):
+        inner = obs_obj
+        wrapper = obs_obj
+        bare = True
+    else:
         return obs_obj
-    if isinstance(obs_obj, dict):
-        return decompress_observation(obs_obj)
-    return obs_obj
+
+    bpp = _bpp_sink()
+    if bpp.enabled:
+        step = timestep_of(wrapper)
+        for k, v in inner.items():
+            if isinstance(v, CompressedImagePayload):
+                bpp.record(k, step, v)
+
+    decoded = decompress_observation(inner)
+    if bare:
+        out = decoded
+    else:
+        obs_obj.observation = decoded
+        out = obs_obj
+    _png_sink().dump(out)
+    return out
 
 
 _WRAPPED = False

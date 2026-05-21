@@ -92,4 +92,14 @@ rosetta_client:
     #       LEROBOT_MSILLM_DEVICE    cuda | cpu | cuda:N (auto by default)
     #       LEROBOT_MSILLM_HUB_DIR   override torch.hub cache (offline servers)
     #   * Pretrained weights are CC-BY-NC 4.0 — research/demo use only.
-    image_codec: "none"
+    #     sees). Convert to mp4 with:
+    #   * Debug: set LEROBOT_MSILLM_DUMP_DIR=/path on the SERVER side to
+    #     save every decompressed image as PNG (post-codec, what the policy
+    #       ffmpeg -framerate 30 -pattern_type glob -i 'top/*.png' \
+    #              -c:v libx264 -pix_fmt yuv420p top.mp4
+    #   * BPP metrics: set LEROBOT_MSILLM_BPP_CSV=/path/to/bpp.csv on the
+    #     SERVER side. Each row is (timestep, key, codec, quality,
+    #     payload_bytes, height, width, bpp, cum_avg_bpp, n); cum_avg_bpp
+    #     is a running mean per (key, quality), so the last row of a run
+    #     is the converged compression rate for that quality.
+    image_codec: "msillm"
