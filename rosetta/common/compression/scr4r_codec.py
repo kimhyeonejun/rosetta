@@ -98,6 +98,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 _LOGGER = logging.getLogger("rosetta.common.compression.scr4r")
 
@@ -107,8 +108,12 @@ from .payload import CompressedImagePayload
 
 _VERSION = 1
 _FLAG_MASK_INCLUDED = 0x01
-# version, flags, image_h, image_w, padded_h, padded_w
-_HEADER = struct.Struct("<BBHHHH")
+# version, flags, orig_h, orig_w, image_h, image_w, padded_h, padded_w
+# orig_* is the pre-resize input size; image_* is the codec input after
+# resizing to a multiple of 64 (matching training, which interpolates rather
+# than pads). decode resizes the reconstruction back to orig_*.
+_HEADER = struct.Struct("<BBHHHHHH")
+_CODEC_FACTOR = 64
 # latent_c, latent_h, latent_w (only present when the mask is transmitted)
 _MASK_HEADER = struct.Struct("<HHH")
 
@@ -500,6 +505,16 @@ class Scr4rCompressor:
             .unsqueeze(0)
         )
 
+        # Resize to a multiple of 64 by interpolation — matching training
+        # (Pi05SCR4R._compress), NOT reflect-padding. Feeding the model the same
+        # input distribution it was trained on is critical for reconstruction
+        # quality (and thus the policy's actions).
+        orig_h, orig_w = int(x.shape[-2]), int(x.shape[-1])
+        if orig_h % _CODEC_FACTOR != 0 or orig_w % _CODEC_FACTOR != 0:
+            new_h = ((orig_h + _CODEC_FACTOR - 1) // _CODEC_FACTOR) * _CODEC_FACTOR
+            new_w = ((orig_w + _CODEC_FACTOR - 1) // _CODEC_FACTOR) * _CODEC_FACTOR
+            x = F.interpolate(x, size=(new_h, new_w), mode="bilinear", align_corners=False)
+
         def mask_provider(penultimate: torch.Tensor) -> torch.Tensor:
             return self._selector_mask(selector, meta, penultimate, stream_key, self._enc_prev)
 
@@ -516,7 +531,7 @@ class Scr4rCompressor:
         send = self.send_mask
         flags = _FLAG_MASK_INCLUDED if send else 0
         parts = [
-            _HEADER.pack(_VERSION, flags, int(image_h), int(image_w), int(padded_h), int(padded_w)),
+            _HEADER.pack(_VERSION, flags, orig_h, orig_w, int(image_h), int(image_w), int(padded_h), int(padded_w)),
             struct.pack("<I", len(hyper_bytes)), hyper_bytes,
             struct.pack("<I", len(latent_bytes)), latent_bytes,
         ]
@@ -552,7 +567,7 @@ class Scr4rCompressor:
         head = _HEADER.size
         if len(payload) < head:
             raise ValueError(f"scr4r payload too short ({len(payload)} < {head})")
-        version, flags, image_h, image_w, padded_h, padded_w = _HEADER.unpack(payload[:head])
+        version, flags, orig_h, orig_w, image_h, image_w, padded_h, padded_w = _HEADER.unpack(payload[:head])
         if version != _VERSION:
             raise ValueError(f"unsupported scr4r payload version {version}")
         off = head
@@ -575,6 +590,7 @@ class Scr4rCompressor:
             ).astype(bool)
             mask = torch.from_numpy(bits.reshape(1, latent_c, latent_h, latent_w).copy())
         return {
+            "orig_size": (int(orig_h), int(orig_w)),
             "image_size": (int(image_h), int(image_w)),
             "padded_size": (int(padded_h), int(padded_w)),
             "hyper_bytes": hyper_bytes,
@@ -615,6 +631,7 @@ class Scr4rCompressor:
         fields = self._parse(payload)
         padded_h, padded_w = fields["padded_size"]
         image_h, image_w = fields["image_size"]
+        orig_h, orig_w = fields["orig_size"]
         device = self.device
 
         with torch.inference_mode():
@@ -657,6 +674,12 @@ class Scr4rCompressor:
             dec_device = codec.decoder.blocks[-1].weight.device
             recon = codec.decoder(latent_decoded.to(dec_device)).clamp(0.0, 1.0)
             recon = recon[:, :, :image_h, :image_w]
+            # Resize back to the original input size (inverse of the encode-side
+            # interpolation), matching Pi05SCR4R._decode.
+            if (image_h, image_w) != (orig_h, orig_w):
+                recon = F.interpolate(
+                    recon, size=(orig_h, orig_w), mode="bilinear", align_corners=False
+                ).clamp(0.0, 1.0)
 
         recon = recon.mul(255.0).round_().clamp_(0.0, 255.0).to(torch.uint8)
         return recon.squeeze(0).permute(1, 2, 0).contiguous().cpu().numpy()
