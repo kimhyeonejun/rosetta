@@ -50,9 +50,12 @@ Configuration (environment variables, snapshotted on first model load):
     LEROBOT_SCR4R_DEVICE      'cuda' | 'cpu' | 'cuda:N' (default cuda if avail).
     LEROBOT_SCR4R_STATE_KEY   obs key for the FiLM robot state
                               (default 'observation.state').
-    LEROBOT_SCR4R_STATE_STATS path to QUANTILE stats for the FiLM state, as a
-                              JSON {"q01": [...], "q99": [...]} (or a torch .pt
-                              dict with the same keys). Pi0.5 normalizes
+    LEROBOT_SCR4R_STATE_STATS path to QUANTILE stats for the FiLM state. Either
+                              a flat JSON {"q01": [...], "q99": [...]} (/ .pt),
+                              or a LeRobot dataset meta/stats.json keyed by
+                              feature — the codec reads [state_key].q01/q99
+                              (e.g. observation.state) straight from it. Pi0.5
+                              normalizes
                               observation.state with NormalizationMode.QUANTILES
                               — 2*(x - q01)/(q99 - q01) - 1 → [-1, 1] — and the
                               selector trained on that normalized state. The
@@ -121,10 +124,18 @@ def _resolve_device(requested: str | None) -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def _resolve_state_stats(ckpt: dict):
+def _resolve_state_stats(ckpt: dict, state_key: str):
     """Return (q01, q99) float32 CPU tensors for FiLM-state QUANTILE
     normalization, or (None, None). Checkpoint-baked stats win over the env
-    path."""
+    path.
+
+    ``LEROBOT_SCR4R_STATE_STATS`` may point at either:
+      * a flat ``{"q01": [...], "q99": [...]}`` JSON / torch .pt, or
+      * a LeRobot dataset ``meta/stats.json`` keyed by feature — we dig into
+        ``[state_key]["q01"/"q99"]`` (e.g. observation.state). This lets the
+        codec read stats straight from the dataset without a separate export
+        or baking them into the checkpoint.
+    """
     q01 = ckpt.get("state_q01")
     q99 = ckpt.get("state_q99")
     if q01 is None or q99 is None:
@@ -137,7 +148,15 @@ def _resolve_state_stats(ckpt: dict):
             import json
             with open(path) as fh:
                 blob = json.load(fh)
-        q01, q99 = blob["q01"], blob["q99"]
+        if "q01" in blob and "q99" in blob:
+            q01, q99 = blob["q01"], blob["q99"]
+        elif state_key in blob and "q01" in blob[state_key] and "q99" in blob[state_key]:
+            q01, q99 = blob[state_key]["q01"], blob[state_key]["q99"]
+        else:
+            raise KeyError(
+                f"LEROBOT_SCR4R_STATE_STATS={path} has neither top-level q01/q99 "
+                f"nor {state_key!r} with q01/q99 (LeRobot meta/stats.json format)."
+            )
     q01 = torch.as_tensor(np.asarray(q01), dtype=torch.float32).reshape(-1)
     q99 = torch.as_tensor(np.asarray(q99), dtype=torch.float32).reshape(-1)
     return q01, q99
@@ -307,7 +326,7 @@ class Scr4rCompressor:
 
             state_q01, state_q99 = (None, None)
             if use_film:
-                state_q01, state_q99 = _resolve_state_stats(ckpt)
+                state_q01, state_q99 = _resolve_state_stats(ckpt, self.state_key)
                 if state_q01 is None:
                     import logging
                     logging.getLogger(__name__).warning(
