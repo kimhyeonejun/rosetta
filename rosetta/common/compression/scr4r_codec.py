@@ -89,13 +89,17 @@ Bytestream layout (self-describing; the decoder needs no out-of-band config):
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import struct
 import threading
+import time
 
 import numpy as np
 import torch
+
+_LOGGER = logging.getLogger("rosetta.common.compression.scr4r")
 
 from .base import get, register
 from .observation import IMAGE_KEY_PREFIX, is_image_array
@@ -461,6 +465,8 @@ class Scr4rCompressor:
     def encode_observation(self, obs: dict) -> dict:
         codec, selector, meta = self._get_bundle()
         out: dict = {}
+        t0 = time.perf_counter()
+        n = 0
         with self._inference_lock:
             self._set_film(selector, meta, obs)
             for k, v in obs.items():
@@ -471,8 +477,12 @@ class Scr4rCompressor:
                         dtype=str(v.dtype),
                         data=self._encode_image(codec, selector, meta, v, self._stream_key(k)),
                     )
+                    n += 1
                 else:
                     out[k] = v
+        if os.environ.get("LEROBOT_SCR4R_TIMING"):
+            dt = (time.perf_counter() - t0) * 1000
+            _LOGGER.warning("[scr4r] encode %d cam(s) on %s: %.0f ms", n, self.device, dt)
         return out
 
     def _encode_image(self, codec, selector, meta, image: np.ndarray, stream_key: str) -> bytes:
@@ -577,6 +587,8 @@ class Scr4rCompressor:
     def decode_observation(self, obs: dict) -> dict:
         codec, selector, meta = self._get_bundle()
         out: dict = {}
+        t0 = time.perf_counter()
+        n = 0
         with self._inference_lock:
             self._set_film(selector, meta, obs)
             for k, v in obs.items():
@@ -589,10 +601,14 @@ class Scr4rCompressor:
                             f"expected shape={v.shape}, dtype={v.dtype}"
                         )
                     out[k] = arr
+                    n += 1
                 elif isinstance(v, CompressedImagePayload):
                     out[k] = get(v.codec).decode(v.data)
                 else:
                     out[k] = v
+        if os.environ.get("LEROBOT_SCR4R_TIMING"):
+            dt = (time.perf_counter() - t0) * 1000
+            _LOGGER.warning("[scr4r] decode %d cam(s) on %s: %.0f ms", n, self.device, dt)
         return out
 
     def _decode_image(self, codec, selector, meta, payload: bytes, stream_key: str) -> np.ndarray:
