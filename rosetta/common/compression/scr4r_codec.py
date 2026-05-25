@@ -54,8 +54,11 @@ Configuration (environment variables, snapshotted on first model load):
                               a flat JSON {"q01": [...], "q99": [...]} (/ .pt),
                               or a LeRobot dataset meta/stats.json keyed by
                               feature — the codec reads [state_key].q01/q99
-                              (e.g. observation.state) straight from it. Pi0.5
-                              normalizes
+                              (e.g. observation.state) straight from it. If
+                              unset, the codec falls back to the project-
+                              standard dataset stats (_DEFAULT_STATE_STATS)
+                              when that file exists, so no per-machine setup is
+                              needed. Pi0.5 normalizes
                               observation.state with NormalizationMode.QUANTILES
                               — 2*(x - q01)/(q99 - q01) - 1 → [-1, 1] — and the
                               selector trained on that normalized state. The
@@ -117,6 +120,16 @@ _DEFAULT_ALIAS_MAP: dict[str, str] = {
     "wrist": "wrist_0_rgb",
 }
 
+# Project-standard dataset stats location (same absolute path on the dev box,
+# the GPU server, and the robot client). When the FiLM checkpoint carries no
+# baked stats and no env override is set, the codec falls back to reading
+# observation.state q01/q99 straight from here — so no per-machine setup is
+# needed. Override with LEROBOT_SCR4R_STATE_STATS if your dataset lives
+# elsewhere.
+_DEFAULT_STATE_STATS = (
+    "/workspaces/rosetta_ws/datasets/lerobot/pyper/effl_dataset/meta/stats.json"
+)
+
 
 def _resolve_device(requested: str | None) -> str:
     if requested:
@@ -140,6 +153,8 @@ def _resolve_state_stats(ckpt: dict, state_key: str):
     q99 = ckpt.get("state_q99")
     if q01 is None or q99 is None:
         path = os.environ.get("LEROBOT_SCR4R_STATE_STATS")
+        if not path and os.path.exists(_DEFAULT_STATE_STATS):
+            path = _DEFAULT_STATE_STATS  # project-standard dataset location
         if not path:
             return None, None
         if path.endswith((".pt", ".pth")):
