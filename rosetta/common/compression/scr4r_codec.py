@@ -90,6 +90,7 @@ Bytestream layout (self-describing; the decoder needs no out-of-band config):
 from __future__ import annotations
 
 import os
+import re
 import struct
 import threading
 
@@ -397,22 +398,55 @@ class Scr4rCompressor:
     def _set_film(self, selector, meta, obs: dict) -> None:
         if not meta["use_film"]:
             return
-        state = obs.get(self.state_key)
-        if state is None:
-            raise KeyError(
-                f"scr4r selector was trained with FiLM (robot_state_dim="
-                f"{meta['robot_state_dim']}) but obs has no '{self.state_key}'. "
-                f"Set LEROBOT_SCR4R_STATE_KEY, or retrain with robot_state_dim=0."
-            )
-        t = torch.as_tensor(np.asarray(state), dtype=torch.float32)  # CPU
-        if t.ndim == 1:
-            t = t.unsqueeze(0)
+        state = self._gather_state(obs)                       # np.ndarray [D]
+        t = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)  # [1, D], CPU
         q01, q99 = meta["state_q01"], meta["state_q99"]
         if q01 is not None:
             # QUANTILES, matching Pi0.5's NormalizationMode.QUANTILES at train
             # time: 2*(x - q01)/(q99 - q01) - 1 → [-1, 1].
             t = 2.0 * (t - q01) / (q99 - q01).clamp_min(1e-8) - 1.0
         selector.set_conditioning(robot_state=t)
+
+    def _gather_state(self, obs: dict) -> np.ndarray:
+        """Assemble the FiLM robot-state vector from the observation.
+
+        The Rosetta raw client flattens a JointState into per-name scalar keys
+        (e.g. ``position.joint1`` … ``position.gripper``) rather than a single
+        ``observation.state`` array, so the codec reassembles the vector here.
+        Order must match training (the contract selector order = the q01/q99
+        order). Resolution:
+          1. a single array under ``self.state_key`` (LEROBOT_SCR4R_STATE_KEY);
+          2. explicit ordered component keys from ``LEROBOT_SCR4R_STATE_KEYS``;
+          3. auto: piper-style ``position.joint{N}`` (numeric order) + trailing
+             ``position.gripper``.
+        Same obs reaches encode (client) and decode (server), so any of these
+        yields an identical vector on both ends.
+        """
+        v = obs.get(self.state_key)
+        if v is not None:
+            return np.asarray(v, dtype=np.float32).reshape(-1)
+
+        keys_env = os.environ.get("LEROBOT_SCR4R_STATE_KEYS")
+        if keys_env:
+            keys = [k.strip() for k in keys_env.split(",") if k.strip()]
+        else:
+            joints = sorted(
+                (k for k in obs if re.fullmatch(r"position\.joint\d+", str(k))),
+                key=lambda k: int(str(k).rsplit("joint", 1)[1]),
+            )
+            keys = joints + (["position.gripper"] if "position.gripper" in obs else [])
+
+        if not keys or any(k not in obs for k in keys):
+            raise KeyError(
+                f"scr4r FiLM (robot_state_dim) needs the robot state, but "
+                f"'{self.state_key}' is absent and component keys "
+                f"{keys or '(none auto-detected)'} are not all present. Set "
+                f"LEROBOT_SCR4R_STATE_KEY or LEROBOT_SCR4R_STATE_KEYS. "
+                f"Available obs keys: {sorted(map(str, obs))}."
+            )
+        return np.asarray(
+            [float(np.asarray(obs[k]).reshape(-1)[0]) for k in keys], dtype=np.float32
+        )
 
     # --- stream-key mapping ---------------------------------------------
 
