@@ -15,6 +15,9 @@ non-image values are passed through untouched.
 """
 from __future__ import annotations
 
+import logging
+import os
+import time
 from typing import Any
 
 import numpy as np
@@ -23,6 +26,14 @@ from .base import ImageCompressor, get
 from .payload import CompressedImagePayload
 
 IMAGE_KEY_PREFIX = "observation.images."
+
+_TIMING_LOG = logging.getLogger("rosetta.common.compression.timing")
+
+
+def _timing_on() -> bool:
+    return bool(
+        os.environ.get("LEROBOT_CODEC_TIMING") or os.environ.get("LEROBOT_SCR4R_TIMING")
+    )
 
 
 def is_image_array(key: str, value: Any) -> bool:
@@ -52,21 +63,28 @@ def compress_observation(
     stream identity, and a rolling frame history — implement the hook and
     receive the whole observation dict at once.
     """
+    t0 = time.perf_counter()
     encode_observation = getattr(compressor, "encode_observation", None)
     if callable(encode_observation):
-        return encode_observation(obs)
-
-    out: dict[str, Any] = {}
-    for k, v in obs.items():
-        if is_image_array(k, v):
-            out[k] = CompressedImagePayload(
-                codec=compressor.name,
-                shape=tuple(v.shape),
-                dtype=str(v.dtype),
-                data=compressor.encode(v),
-            )
-        else:
-            out[k] = v
+        out = encode_observation(obs)
+    else:
+        out = {}
+        for k, v in obs.items():
+            if is_image_array(k, v):
+                out[k] = CompressedImagePayload(
+                    codec=compressor.name,
+                    shape=tuple(v.shape),
+                    dtype=str(v.dtype),
+                    data=compressor.encode(v),
+                )
+            else:
+                out[k] = v
+    if _timing_on():
+        n = sum(1 for v in out.values() if isinstance(v, CompressedImagePayload))
+        _TIMING_LOG.warning(
+            "[codec-timing] compress codec=%s %d img: %.0f ms",
+            getattr(compressor, "name", "?"), n, (time.perf_counter() - t0) * 1000,
+        )
     return out
 
 
@@ -83,14 +101,25 @@ def decompress_observation(obs: dict[str, Any]) -> dict[str, Any]:
     the robot state + per-stream history rather than transmitting it), the
     whole dict is handed to it. Per-image codecs fall through to the loop.
     """
+    t0 = time.perf_counter()
+    codec_name = "?"
     for v in obs.values():
         if isinstance(v, CompressedImagePayload):
+            codec_name = v.codec
             decode_observation = getattr(get(v.codec), "decode_observation", None)
             if callable(decode_observation):
-                return decode_observation(obs)
+                out = decode_observation(obs)
+                if _timing_on():
+                    n = sum(1 for x in obs.values() if isinstance(x, CompressedImagePayload))
+                    _TIMING_LOG.warning(
+                        "[codec-timing] decompress codec=%s %d img: %.0f ms",
+                        codec_name, n, (time.perf_counter() - t0) * 1000,
+                    )
+                return out
             break
 
     out: dict[str, Any] = {}
+    n = 0
     for k, v in obs.items():
         if isinstance(v, CompressedImagePayload):
             codec = get(v.codec)
@@ -102,6 +131,12 @@ def decompress_observation(obs: dict[str, Any]) -> dict[str, Any]:
                     f"expected shape={v.shape}, dtype={v.dtype}"
                 )
             out[k] = arr
+            n += 1
         else:
             out[k] = v
+    if _timing_on():
+        _TIMING_LOG.warning(
+            "[codec-timing] decompress codec=%s %d img: %.0f ms",
+            codec_name, n, (time.perf_counter() - t0) * 1000,
+        )
     return out
