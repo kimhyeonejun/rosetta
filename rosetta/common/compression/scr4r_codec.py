@@ -49,9 +49,19 @@ Configuration (environment variables, snapshotted on first model load):
     LEROBOT_SCR4R_CHECKPOINT  path to the SCR4R .pt checkpoint (REQUIRED).
     LEROBOT_SCR4R_DEVICE      'cuda' | 'cpu' | 'cuda:N' (default cuda if avail).
     LEROBOT_SCR4R_STATE_KEY   obs key for the FiLM robot state
-                              (default 'observation.state'). Used raw; if your
-                              selector trained on normalized state, normalize
-                              before it reaches the codec on BOTH ends.
+                              (default 'observation.state').
+    LEROBOT_SCR4R_STATE_STATS path to MEAN_STD stats for the FiLM state, as a
+                              JSON {"mean": [...], "std": [...]} (or a torch .pt
+                              dict with the same keys). The selector trained on
+                              lerobot-normalized state, but the codec sees raw
+                              state on both ends (normalization runs later, in
+                              the policy preprocessor). Without stats the raw
+                              state is out-of-distribution for the selector —
+                              the round-trip stays exact (both ends agree) but
+                              mask quality degrades. Supply the dataset/policy
+                              stats here (or bake "state_mean"/"state_std" into
+                              the checkpoint) to match training. Applied as
+                              (x - mean) / std on both ends.
     LEROBOT_SCR4R_NUM_HEADS   selector attention heads — NOT recoverable from
                               the state_dict, must match training (default 8).
     LEROBOT_SCR4R_SEND_MASK   '1' to transmit the mask instead of recomputing
@@ -107,6 +117,28 @@ def _resolve_device(requested: str | None) -> str:
     if requested:
         return requested
     return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _resolve_state_stats(ckpt: dict):
+    """Return (mean, std) float32 CPU tensors for FiLM-state normalization, or
+    (None, None). Checkpoint-baked stats win over the env path."""
+    mean = ckpt.get("state_mean")
+    std = ckpt.get("state_std")
+    if mean is None or std is None:
+        path = os.environ.get("LEROBOT_SCR4R_STATE_STATS")
+        if not path:
+            return None, None
+        if path.endswith((".pt", ".pth")):
+            blob = torch.load(path, map_location="cpu", weights_only=False)
+            mean, std = blob["mean"], blob["std"]
+        else:
+            import json
+            with open(path) as fh:
+                blob = json.load(fh)
+            mean, std = blob["mean"], blob["std"]
+    mean = torch.as_tensor(np.asarray(mean), dtype=torch.float32).reshape(-1)
+    std = torch.as_tensor(np.asarray(std), dtype=torch.float32).reshape(-1)
+    return mean, std
 
 
 def _flatten_strings(x) -> bytes:
@@ -271,11 +303,25 @@ class Scr4rCompressor:
             else:
                 codec.update()
 
+            state_mean, state_std = (None, None)
+            if use_film:
+                state_mean, state_std = _resolve_state_stats(ckpt)
+                if state_mean is None:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "[scr4r] FiLM selector but no state stats "
+                        "(LEROBOT_SCR4R_STATE_STATS / checkpoint state_mean+std). "
+                        "Using RAW state — out-of-distribution vs training; mask "
+                        "quality will degrade. Round-trip stays exact."
+                    )
+
             meta = {
                 "use_film": use_film,
                 "robot_state_dim": robot_state_dim,
                 "history_len": history_len,
                 "latent_features": latent_features,
+                "state_mean": state_mean,
+                "state_std": state_std,
             }
             bundle = (codec, selector, meta)
             self._bundle[device] = bundle
@@ -325,6 +371,10 @@ class Scr4rCompressor:
         t = torch.as_tensor(np.asarray(state), dtype=torch.float32)  # CPU
         if t.ndim == 1:
             t = t.unsqueeze(0)
+        mean, std = meta["state_mean"], meta["state_std"]
+        if mean is not None:
+            # MEAN_STD, matching lerobot's NormalizerProcessorStep at train time.
+            t = (t - mean) / std.clamp_min(1e-8)
         selector.set_conditioning(robot_state=t)
 
     # --- stream-key mapping ---------------------------------------------
