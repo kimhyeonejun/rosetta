@@ -42,7 +42,20 @@ def is_image_array(key: str, value: Any) -> bool:
 def compress_observation(
     obs: dict[str, Any], compressor: ImageCompressor
 ) -> dict[str, Any]:
-    """Replace every image array with a CompressedImagePayload."""
+    """Replace every image array with a CompressedImagePayload.
+
+    A codec may opt into *observation-level* encoding by implementing
+    ``encode_observation(obs) -> dict``. Stateless per-image codecs (msillm,
+    identity) don't, so they take the default per-image path below. Codecs
+    that need cross-stream context at encode time — e.g. scr4r, whose
+    temporal selector is conditioned on the robot state, the per-camera
+    stream identity, and a rolling frame history — implement the hook and
+    receive the whole observation dict at once.
+    """
+    encode_observation = getattr(compressor, "encode_observation", None)
+    if callable(encode_observation):
+        return encode_observation(obs)
+
     out: dict[str, Any] = {}
     for k, v in obs.items():
         if is_image_array(k, v):
@@ -63,7 +76,20 @@ def decompress_observation(obs: dict[str, Any]) -> dict[str, Any]:
     Each payload carries its own codec name so different keys can use different
     codecs in principle. The receiving side does not need to know which one was
     used in advance.
+
+    Symmetric to ``compress_observation``: if the codec that produced the
+    payloads provides an observation-level ``decode_observation(obs)`` hook
+    (e.g. scr4r, which recomputes its selection mask from the decoded hyper +
+    the robot state + per-stream history rather than transmitting it), the
+    whole dict is handed to it. Per-image codecs fall through to the loop.
     """
+    for v in obs.values():
+        if isinstance(v, CompressedImagePayload):
+            decode_observation = getattr(get(v.codec), "decode_observation", None)
+            if callable(decode_observation):
+                return decode_observation(obs)
+            break
+
     out: dict[str, Any] = {}
     for k, v in obs.items():
         if isinstance(v, CompressedImagePayload):

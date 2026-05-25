@@ -35,8 +35,9 @@ from .observation import (
 from .payload import CompressedImagePayload
 
 # Side-effect imports register codecs in the global registry.
-from . import identity  # noqa: F401  -> registers 'identity'
-from . import msillm    # noqa: F401  -> registers 'msillm'
+from . import identity     # noqa: F401  -> registers 'identity'
+from . import msillm       # noqa: F401  -> registers 'msillm'
+from . import scr4r_codec  # noqa: F401  -> registers 'scr4r'
 
 __all__ = [
     "ImageCompressor",
