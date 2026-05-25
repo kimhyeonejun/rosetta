@@ -637,3 +637,36 @@ def _dec_string(msg: Any, spec: ObservationStreamSpec) -> str:
     """Decode std_msgs/String to Python string."""
     _ = spec  # Unused
     return str(msg.data)
+
+
+# =============================================================================
+# Piper PosCmd Decoder (Cartesian end-effector command)
+# =============================================================================
+
+
+_POSCMD_FIELDS = ("x", "y", "z", "roll", "pitch", "yaw", "gripper", "mode1", "mode2")
+
+
+@register_decoder("piper_msgs/msg/PosCmd", dtype="float64")
+def _dec_pos_cmd(msg: Any, spec: ObservationStreamSpec) -> np.ndarray:
+    """Decode piper_msgs/PosCmd (task-space leader command).
+
+    Fields: x, y, z, roll, pitch, yaw, gripper, mode1, mode2.
+    Without selector.names: returns the canonical 7-D pose [x,y,z,roll,pitch,yaw,gripper]
+    (mode1/mode2 are control flags, not part of the action vector).
+    With selector.names: returns the selected fields in order.
+    """
+    if not spec.names:
+        return np.array(
+            [msg.x, msg.y, msg.z, msg.roll, msg.pitch, msg.yaw, msg.gripper],
+            dtype=np.float64,
+        )
+
+    out = []
+    for name in spec.names:
+        if name not in _POSCMD_FIELDS:
+            raise ValueError(
+                f"Unknown PosCmd field '{name}'. Allowed: {_POSCMD_FIELDS}"
+            )
+        out.append(float(getattr(msg, name)))
+    return np.asarray(out, dtype=np.float64)

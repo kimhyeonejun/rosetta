@@ -1,0 +1,150 @@
+# SCR4R training config for lerobot pi0.5 + MS-ILLM (hific_scr).
+# Mirrors conf/scr4r/msillm_defaults.yaml + conf/scr4r/train.yaml from
+# the IC4R repo so every research knob in the upstream sweep is exposed
+# here. Override on the CLI with OmegaConf dot-path syntax:
+#
+#   python -m scr4r.train --config <this> \
+#     msillm.quality=vlo2 msillm.training_stage=combined \
+#     msillm.rate_distortion_lambda=0.05 ...
+
+dataset:
+  # Pyper single-arm dataset (state=7, action=7, 3 cameras @ 224×224, 30 fps,
+  # 182 episodes / 123788 frames, lerobot v3.0). Lives outside the
+  # per-user /home1 quota tier on the bulk /home volume.
+  repo_id: pyper/effl_dataset
+  root: /home/khj20343/IC4R/data/lerobot/pyper/effl_dataset
+  episodes: null
+  video_backend: null
+
+vla:
+  # PI05Policy.from_pretrained — must match the dataset's action/state schema.
+  # NOTE: the base config does not pin a single checkpoint. Use one of the
+  # per-task overlays (configs/train_scr4r_pi05_task{0,1,2}.yaml) to select
+  # the right Pyper-trained pi05 and its episode subset; the launcher
+  # picks the overlay via TASK=<0|1|2>. lerobot/pi05_base (Aloha bimanual)
+  # is NOT compatible with the Pyper 3-cam top/side/wrist layout.
+  pretrained: ???
+  # Batch key the FiLM selector reads the robot state from. Pyper stores
+  # the 7-D state under "observation.state"; lerobot's NormalizerProcessorStep
+  # MEAN_STD-normalizes it before forward.
+  state_key: observation.state
+  # Frozen VLA dtype. Default bfloat16 because pi05 (~3.5B params, ~14 GB
+  # fp32) saturates an 80 GB A100 once we cat per-camera SigLIP activations
+  # with a 50-token action chunk; fp32 batch_size=12 OOMs. bf16 is safe for
+  # SCR4R — we only need pi05's image gradient direction, not its weight
+  # precision (the codec/selector remain fp32 in their own param groups).
+  # Set to "float32" if you need exact-fp32 VLA loss.
+  dtype: bfloat16
+
+# Per-dataset / per-VLA streams compressed by SCR4R. Maps the three Pyper
+# raw camera keys → canonical selector stream names used by upstream
+# SCR4R checkpoints (base_0_rgb / base_1_rgb / wrist_0_rgb). The selector
+# stream_embeddings table is keyed by these canonical names, so keeping
+# this alias preserves ckpt compatibility with the OpenPI pipeline.
+profile:
+  name: lerobot_pi05_pyper
+  compress_streams:
+    - observation.images.top
+    - observation.images.side
+    - observation.images.wrist
+  canonical_alias_map:
+    observation.images.top: base_0_rgb
+    observation.images.side: base_1_rgb
+    observation.images.wrist: wrist_0_rgb
+  selector_context_order: ["base_0_rgb", "base_1_rgb", "wrist_0_rgb"]
+
+# ── MS-ILLM + selector knobs (mirrored from msillm_defaults.yaml) ────────
+msillm:
+  enabled: true
+  model_type: "hific_scr"
+
+  quality: 6
+  pretrained_checkpoint: null   # SCR4R-format ckpt for full warm-start (codec + selector)
+  latent_features: 220
+  hyper_features: 320
+
+  freeze_encoder: true
+  freeze_bottleneck: ${msillm.freeze_encoder}
+  freeze_decoder: false
+
+  # combined → first decoder_warmup_steps are decoder-only, then SCR4R
+  # decoder  → all steps decoder-only (no selector / rate)
+  # scr4r    → no decoder warmup, full SCR4R objective
+  training_stage: combined
+  decoder_warmup_steps: 15000
+
+  rate_distortion_lambda: 0.05
+  grad_scale: 1.0
+  hyper_weight: 1.0
+  # Exponent on per-cell bit cost in the latent-mask rate term.
+  #   w[i]      = (-log2 y[i])^mask_rate_alpha
+  #   rate_loss = raw_y_bpp · Σ(w · mask) / Σ w
+  mask_rate_alpha: 0.4
+
+  # Per-stream compression toggles (canonical names).
+  compress_image: true            # base_0_rgb
+  compress_second_image: true     # base_1_rgb
+  compress_wrist_image: true      # wrist_0_rgb
+
+  lr: 5.0e-5
+  selector_lr: null               # null → use lr for selector too
+
+  # FiLM conditioning state dim (raw robot state). Set to 0 to disable FiLM.
+  robot_state_dim: 7
+  replan_steps: 5
+  # Chunk-aligned history: stride the training dataset by `replan_steps`
+  # with a per-epoch random offset so the rolling feature cache feeds the
+  # selector "1 replan-step back" features — matching eval's mask_net
+  # cadence. Requires training.shuffle=false.
+  chunk_aligned_history: true
+
+  # Selector architecture.
+  selector_hidden_dim: 320
+  selector_num_layers: 2
+  selector_num_heads: 8
+  selector_mlp_ratio: 4.0
+  selector_dropout: 0.0
+  selector_temporal_history: 2
+  selector_context_order: ["base_0_rgb", "base_1_rgb", "wrist_0_rgb"]
+  selector_smoothness_keys: ["base_0_rgb", "base_1_rgb", "wrist_0_rgb"]
+  selector_smoothness_weight: 0.0
+
+  # Mask relaxation: noisy_ste | gumbel_softmax.
+  selector_mask_mode: "gumbel_softmax"
+  selector_gumbel_temperature: 1.0
+  selector_gumbel_hard: true
+  # Optional Gumbel-Softmax temperature annealing (linear). null disables.
+  selector_gumbel_temperature_start: null
+  selector_gumbel_anneal_steps: null
+
+  # Selector flags persisted into the checkpoint so eval rebuilds the
+  # selector with matching forward-time behaviour.
+  disable_stream_embedding: false
+  cross_camera_attention: false
+
+  grad_clip_norm: 1.0
+
+  bit_alloc_log_interval: 500
+
+  checkpoint_dir: saved_models/lerobot_pi05_${msillm.training_stage}/${msillm.quality}/rd${msillm.rate_distortion_lambda}_rsd${msillm.robot_state_dim}_th${msillm.selector_temporal_history}
+  save_interval: 5000
+  save_top_k: 10
+
+# ── Training loop knobs ──────────────────────────────────────────────────
+training:
+  device: cuda
+  seed: 42
+  batch_size: 12
+  num_workers: 2
+  shuffle: false
+  steps: 30000
+  weight_decay: 0.0
+  grad_clip: 1.0
+  output_dir: ${msillm.checkpoint_dir}
+
+logging:
+  wandb_enable: true
+  wandb_project: rosetta-scr4r
+  wandb_entity: goodi20343-korea-advanced-institute-of-science-and-techn
+  wandb_run_name: lerobot_pi05_pyper_msillm_${msillm.training_stage}_${msillm.quality}_rd${msillm.rate_distortion_lambda}_rsd${msillm.robot_state_dim}_th${msillm.selector_temporal_history}
+  log_every: 100

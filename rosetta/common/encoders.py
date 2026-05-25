@@ -508,3 +508,59 @@ def _enc_multidof_command(
             msg.values_dot.append(float(arr[values_dot_map[d]]))
 
     return msg
+
+
+# =============================================================================
+# Piper PosCmd Encoder (Cartesian end-effector command)
+# =============================================================================
+
+
+_POSCMD_FIELDS = ("x", "y", "z", "roll", "pitch", "yaw", "gripper", "mode1", "mode2")
+
+
+@register_encoder("piper_msgs/msg/PosCmd")
+def _enc_pos_cmd(
+    action_vec: np.ndarray, spec: ActionStreamSpec, stamp_ns: int | None = None
+) -> Any:
+    """Encode to piper_msgs/PosCmd (task-space leader command).
+
+    Fields: x, y, z, roll, pitch, yaw, gripper, mode1, mode2.
+    Without selector.names: assigns the 7-D action vector to
+    [x, y, z, roll, pitch, yaw, gripper]; mode1/mode2 left at 0.
+    With selector.names: each name must be one of the PosCmd fields above.
+    """
+    _ = stamp_ns  # PosCmd has no header
+    msg_cls = get_message("piper_msgs/msg/PosCmd")
+    msg = msg_cls()
+    # Match the velocity percentage the master arm published during teleop
+    # recording (mode1=50). The driver treats mode1=0 as "use stored default"
+    # which is typically 100% — much faster than what the policy was trained on.
+    msg.mode1 = 50
+
+    arr = _apply_clamp(np.asarray(action_vec, dtype=np.float64).flatten(), spec.clamp)
+
+    if not spec.names:
+        if len(arr) != 7:
+            raise ValueError(
+                f"PosCmd encoder without names expects 7-D action [x,y,z,roll,pitch,yaw,gripper], got {len(arr)}"
+            )
+        msg.x, msg.y, msg.z = float(arr[0]), float(arr[1]), float(arr[2])
+        msg.roll, msg.pitch, msg.yaw = float(arr[3]), float(arr[4]), float(arr[5])
+        msg.gripper = float(arr[6])
+        return msg
+
+    if len(spec.names) != len(arr):
+        raise ValueError(f"names length ({len(spec.names)}) != action length ({len(arr)})")
+
+    for name, value in zip(spec.names, arr):
+        if name not in _POSCMD_FIELDS:
+            raise ValueError(
+                f"Unknown PosCmd field '{name}'. Allowed: {_POSCMD_FIELDS}"
+            )
+        # mode1/mode2 are int32; cast accordingly
+        if name in ("mode1", "mode2"):
+            setattr(msg, name, int(value))
+        else:
+            setattr(msg, name, float(value))
+
+    return msg

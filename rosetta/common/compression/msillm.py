@@ -28,7 +28,9 @@ without out-of-band coordination):
     [u32 hyper_len]    [hyper_latent_bytes...]
 
 Configuration (environment variables, snapshotted on first model load):
-    LEROBOT_MSILLM_QUALITY   1..6 (default 4 ~ 0.3 bpp). Encoder-side only;
+    LEROBOT_MSILLM_QUALITY   1..6 (default 4 ~ 0.3 bpp), or 'vlo1'/'vlo2'
+                             (ultra-low ICLR 2024 rates — need NC GitHub main,
+                             not the PyPI release). Encoder-side only;
                              the decoder reads quality from the payload.
     LEROBOT_MSILLM_DEVICE    'cuda' | 'cpu' | 'cuda:N' (default cuda if available)
     LEROBOT_MSILLM_HUB_DIR   override torch.hub cache (offline-server friendly)
@@ -51,7 +53,38 @@ _VERSION = 1
 _PAD_FACTOR = 64
 # u8 version, u8 quality, u16 image_h, u16 image_w, u16 padded_h, u16 padded_w
 _HEADER = struct.Struct("<BBHHHH")
-_VALID_QUALITIES = (1, 2, 3, 4, 5, 6)
+# quality code -> NC zoo entrypoint. Codes 1..6 are the ICML 2023 MS-ILLM
+# checkpoints (0.035..0.9 bpp). Codes 10/11 are the ICLR 2024 very-low-rate
+# follow-up (vlo1=0.00218 bpp, vlo2=0.00438 bpp) — only present in
+# neuralcompression GitHub main (not the PyPI release).
+_QUALITY_ENTRYPOINT: dict[int, str] = {
+    1: "msillm_quality_1",
+    2: "msillm_quality_2",
+    3: "msillm_quality_3",
+    4: "msillm_quality_4",
+    5: "msillm_quality_5",
+    6: "msillm_quality_6",
+    10: "msillm_quality_vlo1",
+    11: "msillm_quality_vlo2",
+}
+_VALID_QUALITIES: tuple[int, ...] = tuple(_QUALITY_ENTRYPOINT)
+# Friendly aliases callers may pass via env var or configure(): "vlo1"/"vlo2".
+_QUALITY_ALIASES: dict[str, int] = {"vlo1": 10, "vlo2": 11}
+
+
+def _parse_quality(raw) -> int:
+    """Normalise quality from env-var/config to its integer code.
+
+    Accepts int (1..6, 10, 11), int-as-string, or alias strings 'vlo1'/'vlo2'
+    (case-insensitive). Caller is responsible for checking membership in
+    ``_VALID_QUALITIES`` afterwards.
+    """
+    if isinstance(raw, int):
+        return raw
+    s = str(raw).strip().lower()
+    if s in _QUALITY_ALIASES:
+        return _QUALITY_ALIASES[s]
+    return int(s)
 
 
 def _resolve_device(requested: str | None) -> str:
@@ -98,7 +131,7 @@ class MsIllmCompressor:
         if self._configured_quality is not None:
             return self._configured_quality
         env = os.environ.get("LEROBOT_MSILLM_QUALITY")
-        return int(env) if env else 4
+        return _parse_quality(env) if env else 4
 
     @property
     def device(self) -> str:
@@ -107,19 +140,26 @@ class MsIllmCompressor:
         return _resolve_device(os.environ.get("LEROBOT_MSILLM_DEVICE"))
 
     def configure(
-        self, *, quality: int | None = None, device: str | None = None
+        self,
+        *,
+        quality: int | str | None = None,
+        device: str | None = None,
     ) -> None:
         """Override env-var defaults at runtime (e.g. inside tests).
 
-        Does not invalidate already-loaded models; call ``reset()`` first if
-        switching device after a model has been instantiated.
+        ``quality`` may be an int code (1..6 / 10 / 11) or an alias string
+        ('vlo1', 'vlo2'). Does not invalidate already-loaded models; call
+        ``reset()`` first if switching device after a model has been
+        instantiated.
         """
         if quality is not None:
-            if quality not in _VALID_QUALITIES:
+            q = _parse_quality(quality)
+            if q not in _VALID_QUALITIES:
                 raise ValueError(
-                    f"quality must be one of {_VALID_QUALITIES}; got {quality}"
+                    f"quality must be one of {_VALID_QUALITIES} "
+                    f"(or aliases {sorted(_QUALITY_ALIASES)}); got {quality!r}"
                 )
-            self._configured_quality = int(quality)
+            self._configured_quality = q
         if device is not None:
             self._configured_device = device
 
@@ -140,14 +180,38 @@ class MsIllmCompressor:
 
             hub_dir = os.environ.get("LEROBOT_MSILLM_HUB_DIR")
             if hub_dir:
+                # Affects torch.hub.load_state_dict_from_url called inside
+                # neuralcompression.zoo._build_msillm.
                 torch.hub.set_dir(hub_dir)
 
-            entrypoint = f"msillm_quality_{quality}"
-            model = torch.hub.load(
-                "facebookresearch/NeuralCompression",
-                entrypoint,
-                trust_repo=True,
-            )
+            # Don't use torch.hub.load(): it pulls the *latest* hubconf.py from
+            # facebookresearch/NeuralCompression main, which imports newer
+            # zoo entrypoints (msillm_quality_vlo1/vlo2 from the ICLR 2024
+            # follow-up) that aren't exported by the PyPI release. Importing
+            # from the installed package keeps us pinned to whatever version
+            # neuralcompression>=0.3 actually provides.
+            import neuralcompression.zoo as nc_zoo
+
+            entrypoint = _QUALITY_ENTRYPOINT[quality]
+            try:
+                build = getattr(nc_zoo, entrypoint)
+            except AttributeError as e:
+                import neuralcompression as nc
+
+                installed = getattr(nc, "__version__", "unknown")
+                hint = (
+                    " vlo1/vlo2 require the ICLR 2024 NC release (GitHub "
+                    "main); reinstall with `pip install --no-deps -U "
+                    "'neuralcompression @ "
+                    "git+https://github.com/facebookresearch/NeuralCompression'`."
+                    if quality in (10, 11)
+                    else ""
+                )
+                raise RuntimeError(
+                    f"neuralcompression {installed} has no entrypoint "
+                    f"'{entrypoint}'.{hint}"
+                ) from e
+            model = build(pretrained=True)
             model.eval()
             model.update()
             if device != "cpu":

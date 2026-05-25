@@ -1,0 +1,25 @@
+# Overlay for SCR4R training on dataset task_2 only.
+# Pairs the Pyper task_2_checkpoint VLA with the episodes it was trained on
+# (read from pretrained_checkpoints/real_world_checkpoints/task_2_checkpoint/
+#  pretrained_model/train_config.json). Use via:
+#
+#   TASK=2 bash scr4r/scripts/train_scr4r.sh [override.key=value ...]
+#
+# or directly:
+#
+#   python -m scr4r.train \
+#       --config scr4r/configs/train_scr4r_pi05.yaml \
+#       --config scr4r/configs/train_scr4r_pi05_task2.yaml \
+#       [override.key=value ...]
+
+vla:
+  pretrained: /home1/khj20343/IC4R/pretrained_checkpoints/real_world_checkpoints/task_2_checkpoint/pretrained_model
+
+dataset:
+  # Episodes 120..181 (62 eps) — the subset the
+  # task_2_checkpoint VLA was fine-tuned on.
+  episodes: [120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181]
+
+msillm:
+  # Per-task output dir so the three task variants don't collide.
+  checkpoint_dir: saved_models/lerobot_pi05_task2_${msillm.training_stage}/${msillm.quality}/rd${msillm.rate_distortion_lambda}_rsd${msillm.robot_state_dim}_th${msillm.selector_temporal_history}
