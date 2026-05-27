@@ -23,6 +23,7 @@ from typing import Any
 import numpy as np
 
 from .base import ImageCompressor, get
+from .parallel_decode import _decode_one, get_decode_pool
 from .payload import CompressedImagePayload
 
 IMAGE_KEY_PREFIX = "observation.images."
@@ -118,22 +119,31 @@ def decompress_observation(obs: dict[str, Any]) -> dict[str, Any]:
                 return out
             break
 
-    out: dict[str, Any] = {}
-    n = 0
-    for k, v in obs.items():
-        if isinstance(v, CompressedImagePayload):
-            codec = get(v.codec)
-            arr = codec.decode(v.data)
-            if arr.shape != v.shape or str(arr.dtype) != v.dtype:
-                raise ValueError(
-                    f"codec {v.codec!r} round-trip mismatch for {k}: "
-                    f"got shape={arr.shape}, dtype={arr.dtype}; "
-                    f"expected shape={v.shape}, dtype={v.dtype}"
-                )
-            out[k] = arr
-            n += 1
-        else:
-            out[k] = v
+    # Decode every image payload. With >1 image and a configured worker pool,
+    # decode them in parallel processes — the entropy decoding is CPU-bound and
+    # single-threaded, so separate processes are the only way to overlap it.
+    image_items = [(k, v) for k, v in obs.items() if isinstance(v, CompressedImagePayload)]
+    pool = get_decode_pool()
+    if pool is not None and len(image_items) > 1:
+        arrs = list(pool.map(_decode_one, [(v.codec, v.data) for _, v in image_items]))
+    else:
+        arrs = [get(v.codec).decode(v.data) for _, v in image_items]
+
+    decoded_by_key: dict[str, Any] = {}
+    for (k, v), arr in zip(image_items, arrs):
+        if arr.shape != v.shape or str(arr.dtype) != v.dtype:
+            raise ValueError(
+                f"codec {v.codec!r} round-trip mismatch for {k}: "
+                f"got shape={arr.shape}, dtype={arr.dtype}; "
+                f"expected shape={v.shape}, dtype={v.dtype}"
+            )
+        decoded_by_key[k] = arr
+
+    # Preserve original key order; substitute decoded arrays for payloads.
+    out: dict[str, Any] = {
+        k: (decoded_by_key[k] if k in decoded_by_key else v) for k, v in obs.items()
+    }
+    n = len(image_items)
     if _timing_on():
         _TIMING_LOG.warning(
             "[codec-timing] decompress codec=%s %d img: %.0f ms",

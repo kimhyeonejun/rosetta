@@ -131,3 +131,14 @@ def wrap_policy_server() -> None:
 
     pickle.loads = patched_loads  # type: ignore[assignment]
     _WRAPPED = True
+
+    # Build and warm the multiprocess decode pool now, while __main__ is still
+    # this guarded entry point (run_policy_server_compressed). This must happen
+    # before main() calls runpy.run_module(..., alter_sys=True), which rebinds
+    # sys.modules['__main__'] to lerobot's policy_server — spawning workers
+    # after that point risks them re-executing the server. get_decode_pool()
+    # eagerly starts every worker, so all children exist before we return.
+    # No-op when LEROBOT_DECODE_WORKERS=0.
+    from .parallel_decode import get_decode_pool
+
+    get_decode_pool()
